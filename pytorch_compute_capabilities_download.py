@@ -307,15 +307,22 @@ def process_wheel(
         temp_path = Path(temp_dir)
 
         try:
-            # Download
+            # Download (streamed to disk so we never hold the ~850MB wheel in RAM)
             print(f"Downloading {wheel['filename']}...")
             response = requests.get(wheel["url"], stream=True)
             response.raise_for_status()
 
+            total_size = int(response.headers.get("content-length", 0))
+            downloaded = 0
             wheel_path = temp_path / wheel["filename"]
             with open(wheel_path, "wb") as f:
-                f.write(response.content)
-            print(f"Downloaded to {wheel_path}")
+                for chunk in response.iter_content(chunk_size=8192):
+                    f.write(chunk)
+                    downloaded += len(chunk)
+                    if total_size > 0:
+                        percent = (downloaded / total_size) * 100
+                        print(f"\rProgress: {percent:.1f}%", end="", flush=True)
+            print(f"\nDownloaded to {wheel_path}")
 
             # Extract only libtorch_cuda.so
             so_path = extract_libtorch_cuda(wheel_path, temp_path)
