@@ -49,22 +49,35 @@ else
 fi
 
 # --- 4. cuobjdump via the nvidia conda channel ------------------------------
+# Two versions are needed: the latest cuobjdump reads new architectures
+# (sm_100/sm_120, Blackwell) but fatally refuses fat binaries containing
+# removed ones (e.g. sm_37 in older cu118 wheels); the CUDA 11.8 cuobjdump
+# reads sm_37..sm_90. The scripts try both (see PCC_CUOBJDUMP).
 if [ -x "$CONDA_DIR/envs/cuobjdump/bin/cuobjdump" ]; then
-  log "cuobjdump env already exists"
+  log "cuobjdump (latest) env already exists"
 else
-  log "Creating conda env 'cuobjdump' with nvidia::cuda-cuobjdump..."
+  log "Creating conda env 'cuobjdump' with nvidia::cuda-cuobjdump (latest)..."
   "$CONDA_DIR/bin/conda" create -y -n cuobjdump -c nvidia cuda-cuobjdump
 fi
 
-# --- 5. Put cuobjdump on PATH -----------------------------------------------
+if [ -x "$CONDA_DIR/envs/cuobjdump118/bin/cuobjdump" ]; then
+  log "cuobjdump118 env already exists"
+else
+  log "Creating conda env 'cuobjdump118' with nvidia::cuda-cuobjdump=11.8..."
+  "$CONDA_DIR/bin/conda" create -y -n cuobjdump118 -c nvidia "cuda-cuobjdump=11.8.*"
+fi
+
+# --- 5. Put both cuobjdumps on PATH -----------------------------------------
 mkdir -p "$HOME/.local/bin"
 ln -sf "$CONDA_DIR/envs/cuobjdump/bin/cuobjdump" "$HOME/.local/bin/cuobjdump"
+ln -sf "$CONDA_DIR/envs/cuobjdump118/bin/cuobjdump" "$HOME/.local/bin/cuobjdump-118"
 
 # --- 6. Verify --------------------------------------------------------------
 log "Verifying installation..."
 export PATH="$HOME/.local/bin:$PATH"
 uv --version
 cuobjdump --version | head -1
+cuobjdump-118 --version | head -1
 
 cat <<'EOF'
 

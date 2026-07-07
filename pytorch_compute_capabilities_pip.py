@@ -28,6 +28,16 @@ import requests
 # Directory holding one JSON file per analyzed wheel (the resumable cache).
 CACHE_DIR = Path("cache_pip")
 
+# cuobjdump binaries to try, in order. Modern cuobjdump (CUDA 13.x) fatally
+# refuses fat binaries containing removed architectures (e.g. sm_37 in older
+# wheels), emitting nothing; an older cuobjdump (CUDA 11.8) reads sm_37..sm_90.
+# Trying both spans every wheel. Override with $PCC_CUOBJDUMP (comma-separated).
+CUOBJDUMP_CMDS = [
+    c.strip()
+    for c in os.environ.get("PCC_CUOBJDUMP", "cuobjdump,cuobjdump-118").split(",")
+    if c.strip()
+]
+
 
 def set_temp_root(tmpdir_arg: str | None) -> None:
     """
@@ -277,70 +287,42 @@ def get_cuda_architectures(extract_dir: Path) -> list[str]:
         print(f"Warning: {libtorch_path} not found")
         return []
 
-    try:
-        cuobjdump_cmd = "cuobjdump"
-        # Example: cuobjdump_cmd = "singularity exec --bind /path/to/bind_dir /path/to/cuda.sif cuobjdump"
+    # Try each cuobjdump in turn (see CUOBJDUMP_CMDS): modern cuobjdump fatally
+    # refuses fat binaries with removed archs (e.g. sm_37) and emits nothing, so
+    # fall back to an older one. Also parse stdout regardless of return code,
+    # since cuobjdump can print valid arch lines and still exit non-zero
+    # ("Invalid ELF" on a very large libtorch_cuda.so).
+    last_stderr = ""
+    for cuobjdump_cmd in CUOBJDUMP_CMDS:
         command_raw = f"{cuobjdump_cmd} '{libtorch_path}'"
-
         print(f"Running: {command_raw}")
-        # No check=True: cuobjdump can emit valid arch lines and still exit
-        # non-zero (e.g. "Invalid ELF" on a very large libtorch_cuda.so), so we
-        # parse whatever stdout it produced regardless of the return code.
-        result_raw = subprocess.run(
-            command_raw,
-            shell=True,
-            capture_output=True,
-            text=True,
-            executable="/bin/bash",
-        )
+        try:
+            result_raw = subprocess.run(
+                command_raw,
+                shell=True,
+                capture_output=True,
+                text=True,
+                executable="/bin/bash",
+            )
+        except Exception as e:
+            print(f"Error running {cuobjdump_cmd}: {e}")
+            continue
 
-        print(f"cuobjdump output length: {len(result_raw.stdout)} characters")
-
-        # Let's look for lines containing 'arch' (case insensitive)
-        arch_lines = []
-        for line in result_raw.stdout.split("\n"):
-            if "arch" in line.lower():
-                arch_lines.append(line.strip())
-
+        arch_lines = [
+            line.strip()
+            for line in result_raw.stdout.split("\n")
+            if "sm_" in line.lower()
+        ]
         if arch_lines:
-            # Sort and remove duplicates
-            unique_archs = sorted(set(arch_lines))
-            print("Found architectures:")
-            for arch in unique_archs:
-                print(f"  {arch}")
-            return unique_archs
-        else:
-            # Let's see if there are any lines that might contain architecture info
-            print("No lines with 'arch' found. Looking for other patterns...")
+            print(f"  {cuobjdump_cmd}: found {len(arch_lines)} arch line(s)")
+            return sorted(set(arch_lines))
 
-            # Look for sm_ patterns
-            sm_lines = []
-            for line in result_raw.stdout.split("\n"):
-                if "sm_" in line.lower():
-                    sm_lines.append(line.strip())
+        last_stderr = (result_raw.stderr or "").strip()
+        print(f"  {cuobjdump_cmd}: no archs ({last_stderr.splitlines()[0] if last_stderr else 'empty output'})")
 
-            if sm_lines:
-                print("Found lines with 'sm_' pattern:")
-                for line in sm_lines[:10]:  # Show first 10 matches
-                    print(f"  {line}")
-                return sm_lines
-            else:
-                print(
-                    "No architecture patterns found. Showing first 20 lines of cuobjdump output:"
-                )
-                lines = result_raw.stdout.split("\n")
-                for i, line in enumerate(lines[:20]):
-                    print(f"  {i + 1}: {line}")
-                return []
-
-    except subprocess.CalledProcessError as e:
-        print(f"Error running cuobjdump command: {e}")
-        print(f"stdout: {e.stdout}")
-        print(f"stderr: {e.stderr}")
-        return []
-    except Exception as e:
-        print(f"Unexpected error: {e}")
-        return []
+    if last_stderr:
+        print(f"No architectures from any cuobjdump. Last stderr: {last_stderr}")
+    return []
 
 
 def analyze_first_wheel(wheels: list[dict[str, str]]) -> dict[str, Any] | None:

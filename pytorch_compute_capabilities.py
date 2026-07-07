@@ -42,6 +42,16 @@ CHANNELS = {
 BASE_URL = CHANNELS["pytorch"]
 CACHE_DIR = "cache"
 
+# cuobjdump binaries to try, in order. Modern cuobjdump (CUDA 13.x) fatally
+# refuses fat binaries containing removed architectures (e.g. sm_37 in older
+# packages), emitting nothing; an older cuobjdump (CUDA 11.8) reads sm_37..sm_90.
+# Trying both spans every package. Override with $PCC_CUOBJDUMP (comma-separated).
+CUOBJDUMP_CMDS = [
+    c.strip()
+    for c in os.environ.get("PCC_CUOBJDUMP", "cuobjdump,cuobjdump-118").split(",")
+    if c.strip()
+]
+
 
 def strip_extension(fn: str, extensions=[".tar.bz2", ".tar.gz", ".conda"]):
     for ext in extensions:
@@ -185,19 +195,25 @@ def get_summary(pkg_archive_fn) -> Mapping[str, str]:
 
     for lib_fn in lib_fns:
         tqdm.tqdm.write(f"Reading lib {lib_fn}...")
-        # Do not use check_output: cuobjdump can print valid arch lines and then
-        # exit non-zero (e.g. "Invalid ELF" on very large libtorch_cuda.so). We
-        # still want the architectures it managed to emit, so capture stdout
-        # regardless of the return code.
-        proc = subprocess.run(
-            f'cuobjdump "{lib_fn}"',
-            shell=True,
-            capture_output=True,
-            text=True,
-        )
-        output = proc.stdout
-
-        lib_archs = set(m["arch"] for m in parse.findall("arch = {arch}\n", output))
+        # Try each cuobjdump in turn (see CUOBJDUMP_CMDS): modern cuobjdump
+        # (CUDA 13.x) fatally refuses fat binaries with removed archs (e.g.
+        # sm_37) and emits nothing, so fall back to an older one. Do not use
+        # check_output: cuobjdump can print valid arch lines and still exit
+        # non-zero ("Invalid ELF" on very large libtorch_cuda.so), so parse
+        # stdout regardless of the return code.
+        lib_archs: set = set()
+        for cuobjdump_cmd in CUOBJDUMP_CMDS:
+            proc = subprocess.run(
+                f'{cuobjdump_cmd} "{lib_fn}"',
+                shell=True,
+                capture_output=True,
+                text=True,
+            )
+            lib_archs = set(
+                m["arch"] for m in parse.findall("arch = {arch}\n", proc.stdout)
+            )
+            if lib_archs:
+                break
 
         architectures.update(lib_archs)
 

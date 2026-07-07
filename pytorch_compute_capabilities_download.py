@@ -14,6 +14,7 @@ delete → next. Resumable; only one wheel on disk at a time.
 
 from pathlib import Path
 import json
+import os
 import re
 import subprocess
 import sys
@@ -27,6 +28,17 @@ import requests
 BASE_INDEX = "https://download.pytorch.org/whl"
 DEFAULT_VARIANTS = ["cu118", "cu121", "cu124", "cu126", "cu128"]
 CACHE_DIR = Path("cache_download")
+
+# cuobjdump binaries to try, in order. Modern cuobjdump (CUDA 13.x) fatally
+# refuses fat binaries containing removed architectures (e.g. sm_37 in older
+# cu118 wheels), emitting nothing; an older cuobjdump (CUDA 11.8) reads
+# sm_37..sm_90. Trying both spans every wheel. Override with $PCC_CUOBJDUMP
+# (comma-separated).
+CUOBJDUMP_CMDS = [
+    c.strip()
+    for c in os.environ.get("PCC_CUOBJDUMP", "cuobjdump,cuobjdump-118").split(",")
+    if c.strip()
+]
 
 
 def set_temp_root(tmpdir_arg: str | None) -> None:
@@ -227,32 +239,33 @@ def get_cuda_architectures(so_path: Path) -> list[str]:
         print(f"Warning: {so_path} not found")
         return []
 
-    try:
-        cuobjdump_cmd = "cuobjdump"
+    last_stderr = ""
+    for cuobjdump_cmd in CUOBJDUMP_CMDS:
         command_raw = f"{cuobjdump_cmd} '{so_path}'"
-
         print(f"Running: {command_raw}")
-        result = subprocess.run(
-            command_raw,
-            shell=True,
-            capture_output=True,
-            text=True,
-            executable="/bin/bash",
-        )
+        try:
+            result = subprocess.run(
+                command_raw,
+                shell=True,
+                capture_output=True,
+                text=True,
+                executable="/bin/bash",
+            )
+        except Exception as e:
+            print(f"Error running {cuobjdump_cmd}: {e}")
+            continue
 
-        print(f"cuobjdump output length: {len(result.stdout)} characters")
+        clean_archs = re.findall(r"sm_\d+[a-z]*", result.stdout)
+        if clean_archs:
+            print(f"  {cuobjdump_cmd}: {len(result.stdout)} chars, archs found")
+            return sorted(set(clean_archs))
 
-        # Extract sm_XX[a-z]* patterns
-        clean_archs = []
-        for line in result.stdout.split("\n"):
-            matches = re.findall(r"sm_\d+[a-z]*", line)
-            clean_archs.extend(matches)
+        last_stderr = (result.stderr or "").strip()
+        print(f"  {cuobjdump_cmd}: no archs ({last_stderr.splitlines()[0] if last_stderr else 'empty output'})")
 
-        return sorted(set(clean_archs)) if clean_archs else []
-
-    except Exception as e:
-        print(f"Error running cuobjdump: {e}")
-        return []
+    if last_stderr:
+        print(f"No architectures from any cuobjdump. Last stderr: {last_stderr}")
+    return []
 
 
 def cache_path_for_wheel(filename: str) -> Path:
