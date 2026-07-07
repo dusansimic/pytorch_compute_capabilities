@@ -1,15 +1,31 @@
+# /// script
+# dependencies = [
+#   "requests",
+# ]
+# ///
 """
 Analyze all PyTorch 2.x versions and generate comprehensive table. Note the inclusion of 'manylinux_2_28_x86_64' is release name will only find 2.7.0 and newer (currently through 2.8.0).
+
+Each wheel is processed one at a time: download -> cuobjdump -> record result to
+a per-wheel JSON cache (cache_pip/) -> delete the wheel -> next. Reruns skip any
+wheel already present in the cache, so the process is resumable and only ever
+keeps a single wheel on disk at a time. The markdown table is rebuilt from the
+cache after every wheel, so partial progress is never lost.
 """
 
 from pathlib import Path
+import json
 import subprocess
+import sys
 import tempfile
 from typing import Any
 import zipfile
 import re
 
 import requests
+
+# Directory holding one JSON file per analyzed wheel (the resumable cache).
+CACHE_DIR = Path("cache_pip")
 
 
 def get_pypi_package_info(
@@ -201,12 +217,14 @@ def get_cuda_architectures(extract_dir: Path) -> list[str]:
         command_raw = f"{cuobjdump_cmd} '{libtorch_path}'"
 
         print(f"Running: {command_raw}")
+        # No check=True: cuobjdump can emit valid arch lines and still exit
+        # non-zero (e.g. "Invalid ELF" on a very large libtorch_cuda.so), so we
+        # parse whatever stdout it produced regardless of the return code.
         result_raw = subprocess.run(
             command_raw,
             shell=True,
             capture_output=True,
             text=True,
-            check=True,
             executable="/bin/bash",
         )
 
@@ -295,76 +313,114 @@ def analyze_first_wheel(wheels: list[dict[str, str]]) -> dict[str, Any] | None:
         return {"wheel_info": first_wheel, "cuda_architectures": archs}
 
 
-def analyze_all_wheels(
-    wheels: list[dict[str, str]], package_version: str
-) -> list[dict[str, Any]]:
+def cache_path_for_wheel(filename: str) -> Path:
+    """Return the JSON cache path for a given wheel filename."""
+    return CACHE_DIR / f"{filename}.json"
+
+
+def get_cached_result(filename: str) -> dict[str, Any] | None:
+    """Load a previously cached analysis result for a wheel, if present."""
+    cache_file = cache_path_for_wheel(filename)
+    try:
+        with open(cache_file) as f:
+            return json.load(f)
+    except FileNotFoundError:
+        return None
+    except (json.JSONDecodeError, OSError) as e:
+        print(f"Warning: ignoring unreadable cache {cache_file}: {e}")
+        return None
+
+
+def save_result_to_cache(result: dict[str, Any]) -> None:
+    """Persist a single wheel's analysis result to the JSON cache."""
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_file = cache_path_for_wheel(result["wheel_info"]["filename"])
+    with open(cache_file, "w") as f:
+        json.dump(result, f, indent=2)
+
+
+def load_all_cached_results() -> list[dict[str, Any]]:
+    """Load every cached wheel result (used to build the table)."""
+    if not CACHE_DIR.is_dir():
+        return []
+
+    results = []
+    for cache_file in CACHE_DIR.glob("*.json"):
+        try:
+            with open(cache_file) as f:
+                results.append(json.load(f))
+        except (json.JSONDecodeError, OSError) as e:
+            print(f"Warning: skipping unreadable cache {cache_file}: {e}")
+    return results
+
+
+def process_wheel(wheel: dict[str, str], package_version: str) -> dict[str, Any]:
     """
-    Download and analyze all wheel files to extract CUDA architectures.
+    Analyze a single wheel: return cached result if available, otherwise
+    download to a temp dir, run cuobjdump, cache the result, and let the temp
+    dir (and wheel) be deleted on exit. Only one wheel is ever on disk at a time.
 
     Args:
-        wheels: List of wheel information
+        wheel: Wheel information
         package_version: Version string (e.g., '2.8.0')
 
     Returns:
-        List of dictionaries with wheel info and supported architectures
+        Dictionary with wheel info and supported architectures
     """
-    results = []
+    cached = get_cached_result(wheel["filename"])
+    if cached is not None:
+        archs = cached.get("cuda_architectures", [])
+        print(f"↻ Cached {wheel['filename']}: {', '.join(archs) if archs else 'None'}")
+        return cached
 
-    for i, wheel in enumerate(wheels, 1):
-        print(f"\n{'=' * 60}")
-        print(f"Analyzing wheel {i}/{len(wheels)}: {wheel['filename']}")
-        print(f"{'=' * 60}")
+    with tempfile.TemporaryDirectory() as temp_dir:
+        temp_path = Path(temp_dir)
 
-        with tempfile.TemporaryDirectory() as temp_dir:
-            temp_path = Path(temp_dir)
+        try:
+            # Download the wheel
+            wheel_path = download_wheel(wheel["url"], wheel["filename"], temp_path)
 
-            try:
-                # Download the wheel
-                wheel_path = download_wheel(wheel["url"], wheel["filename"], temp_path)
+            # Extract the wheel
+            extract_dir = temp_path / "extracted"
+            extract_dir.mkdir()
+            extract_wheel(wheel_path, extract_dir)
 
-                # Extract the wheel
-                extract_dir = temp_path / "extracted"
-                extract_dir.mkdir()
-                extract_wheel(wheel_path, extract_dir)
+            # Get CUDA architectures
+            archs = get_cuda_architectures(extract_dir)
 
-                # Get CUDA architectures
-                archs = get_cuda_architectures(extract_dir)
+            # Clean up arch strings to just extract sm_XX values
+            clean_archs = []
+            for arch in archs:
+                if "sm_" in arch:
+                    # Extract just the sm_XX part
+                    match = re.search(r"sm_\d+[a-z]*", arch)
+                    if match:
+                        clean_archs.append(match.group())
 
-                # Clean up arch strings to just extract sm_XX values
-                clean_archs = []
-                for arch in archs:
-                    if "sm_" in arch:
-                        # Extract just the sm_XX part
+            result = {
+                "wheel_info": wheel,
+                "cuda_architectures": sorted(set(clean_archs)),
+                "package_version": package_version,
+            }
 
-                        match = re.search(r"sm_\d+[a-z]*", arch)
-                        if match:
-                            clean_archs.append(match.group())
+            print(f"✓ Successfully analyzed {wheel['filename']}")
+            if clean_archs:
+                print(f"  Architectures: {', '.join(sorted(set(clean_archs)))}")
+            else:
+                print("  No CUDA architectures found")
 
-                results.append(
-                    {
-                        "wheel_info": wheel,
-                        "cuda_architectures": sorted(set(clean_archs)),
-                        "package_version": package_version,
-                    }
-                )
+        except Exception as e:
+            print(f"✗ Error analyzing {wheel['filename']}: {e}")
+            # Do not cache failures, so the wheel is retried on the next run.
+            return {
+                "wheel_info": wheel,
+                "cuda_architectures": [],
+                "package_version": package_version,
+            }
 
-                print(f"✓ Successfully analyzed {wheel['filename']}")
-                if clean_archs:
-                    print(f"  Architectures: {', '.join(sorted(set(clean_archs)))}")
-                else:
-                    print("  No CUDA architectures found")
-
-            except Exception as e:
-                print(f"✗ Error analyzing {wheel['filename']}: {e}")
-                results.append(
-                    {
-                        "wheel_info": wheel,
-                        "cuda_architectures": [],
-                        "package_version": package_version,
-                    }
-                )
-
-    return results
+    # Cache only successful analyses (outside the temp dir, wheel already deleted).
+    save_result_to_cache(result)
+    return result
 
 
 def generate_pip_table(
@@ -535,26 +591,44 @@ def main():
         print("No wheels found to process!")
         return
 
-    # Estimate download size (assuming ~850MB per wheel based on torch 2.8.0)
-    estimated_size_gb = (total_wheels_estimate * 850) / 1024
-    print(f"Estimated download size: ~{estimated_size_gb:.1f} GB")
-    print("This will take significant time and bandwidth!")
+    # How many wheels are already cached from a previous run?
+    cached_count = sum(
+        1
+        for version in versions
+        for wheel in get_wheel_download_links(package, version)
+        if get_cached_result(wheel["filename"]) is not None
+    )
+    remaining = total_wheels_estimate - cached_count
+    print(f"Already cached: {cached_count} wheels (will be skipped)")
+
+    # Estimate download size for the remaining wheels only (~850MB per wheel).
+    estimated_size_gb = (remaining * 850) / 1024
+    print(f"Wheels left to download: {remaining} (~{estimated_size_gb:.1f} GB)")
+    print("Each wheel is downloaded, analyzed, then deleted before the next one.")
     print()
 
-    # Ask for confirmation
-    try:
-        confirm = input("Do you want to proceed? (y/N): ").strip().lower()
-        if confirm not in ["y", "yes"]:
-            print("Aborted.")
+    # Ask for confirmation, unless -y/--yes was passed or stdin is non-interactive.
+    assume_yes = any(arg in ("-y", "--yes") for arg in sys.argv[1:])
+    if remaining > 0 and not assume_yes and sys.stdin.isatty():
+        try:
+            confirm = input("Do you want to proceed? (y/N): ").strip().lower()
+            if confirm not in ["y", "yes"]:
+                print("Aborted.")
+                return
+        except KeyboardInterrupt:
+            print("\nAborted.")
             return
-    except KeyboardInterrupt:
-        print("\nAborted.")
-        return
 
-    all_results = []
+    def rebuild_table() -> None:
+        """Regenerate the markdown table from everything currently cached."""
+        results = load_all_cached_results()
+        if results:
+            save_table_to_file(generate_comprehensive_pip_table(results))
+
     total_wheels = 0
 
-    # Process each version
+    # Process each wheel one at a time, rebuilding the table from cache as we go
+    # so that progress survives an interruption.
     for version_idx, version in enumerate(versions, 1):
         wheel_count = version_wheel_counts[version]
 
@@ -569,44 +643,35 @@ def main():
         print(f"{'=' * 80}")
 
         wheels = get_wheel_download_links(package, version)
-        total_wheels += len(wheels)
 
-        # Analyze all wheels for this version
-        version_results = analyze_all_wheels(wheels, version)
-        all_results.extend(version_results)
+        for i, wheel in enumerate(wheels, 1):
+            print(f"\n--- Wheel {i}/{len(wheels)}: {wheel['filename']} ---")
+            result = process_wheel(wheel, version)
+            total_wheels += 1
 
-        # Print summary for this version
-        print(f"\nSummary for {version}:")
-        for result in version_results:
-            wheel_info = result["wheel_info"]
-            archs = result["cuda_architectures"]
-            python_ver = wheel_info["python_version"]
-            arch_count = len(archs)
-            print(
-                f"  Python {python_ver}: {arch_count} architectures - {', '.join(archs) if archs else 'None'}"
-            )
+            # Persist progress after every wheel (only if it was cached, i.e. ok).
+            if get_cached_result(wheel["filename"]) is not None:
+                rebuild_table()
 
-    # Generate comprehensive table
+    # Final table rebuild + summary from the full cache.
+    all_results = load_all_cached_results()
     if all_results:
         print(f"\n{'=' * 80}")
-        print(f"Generating comprehensive table for all {len(versions)} versions...")
-        print(f"Total wheels processed: {total_wheels}")
+        print(f"Generating comprehensive table from {len(all_results)} cached wheels...")
+        print(f"Wheels visited this run: {total_wheels}")
         print(f"{'=' * 80}")
 
-        table_content = generate_comprehensive_pip_table(all_results)
-        save_table_to_file(table_content)
+        rebuild_table()
 
         # Final summary
-        version_counts = {}
+        version_counts: dict[str, int] = {}
         for result in all_results:
             version = result["package_version"]
-            if version not in version_counts:
-                version_counts[version] = 0
-            version_counts[version] += 1
+            version_counts[version] = version_counts.get(version, 0) + 1
 
         print("\nFinal Summary:")
-        print(f"Total PyTorch versions processed: {len(version_counts)}")
-        print(f"Total wheel files analyzed: {len(all_results)}")
+        print(f"Total PyTorch versions in cache: {len(version_counts)}")
+        print(f"Total wheel files in cache: {len(all_results)}")
         for version, count in sorted(version_counts.items(), reverse=True):
             print(f"  {version}: {count} wheels")
 
