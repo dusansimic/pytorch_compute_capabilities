@@ -48,6 +48,22 @@ def set_temp_root(tmpdir_arg: str | None) -> None:
     print(f"Temp root: {tempdir}")
 
 
+def _int_parts(text: str) -> list[int]:
+    """
+    Split a dotted string into integer parts for sorting, tolerating
+    non-numeric components (e.g. "unknown", "2.0.0.post1"). Non-numeric parts
+    sort as -1 so malformed/unknown values sink to the bottom instead of
+    crashing the sort.
+    """
+    parts = []
+    for p in text.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(-1)
+    return parts
+
+
 def get_pypi_package_info(
     package_name: str, version: str | None = None
 ) -> dict[str, Any]:
@@ -81,16 +97,13 @@ def extract_python_version_from_filename(filename: str) -> str:
     Returns:
         Python version string (e.g., '3.13')
     """
-    # Wheel filename format: {package}-{version}-{python_tag}-{abi_tag}-{platform_tag}.whl
-    parts = filename.split("-")
-    if len(parts) >= 3:
-        python_tag = parts[2]  # e.g., 'cp313', 'cp39'
-        if python_tag.startswith("cp"):
-            version_num = python_tag[2:]  # Remove 'cp' prefix
-            if len(version_num) >= 2:
-                major = version_num[0]
-                minor = version_num[1:]
-                return f"{major}.{minor}"
+    # Wheel filename format:
+    #   {name}-{version}[-{build}]-{python_tag}-{abi_tag}-{platform_tag}.whl
+    # The optional build tag can shift positions, so locate the CPython tag
+    # (e.g. cp313, cp39, cp313t) anywhere in the name instead of assuming index.
+    m = re.search(r"cp(\d)(\d{1,2})", filename)
+    if m:
+        return f"{m.group(1)}.{m.group(2)}"
     return "unknown"
 
 
@@ -542,11 +555,7 @@ def get_all_pytorch_2x_versions(package_name: str = "torch") -> list[str]:
                     pytorch_2x_versions.append(version)
 
         # Sort versions using semantic versioning
-        def version_key(v):
-            parts = v.split(".")
-            return [int(x) for x in parts]
-
-        pytorch_2x_versions.sort(key=version_key, reverse=True)  # Latest first
+        pytorch_2x_versions.sort(key=_int_parts, reverse=True)  # Latest first
         return pytorch_2x_versions
 
     except Exception as e:
@@ -587,11 +596,12 @@ def generate_comprehensive_pip_table(all_results: list[dict[str, Any]]) -> str:
         version = result["package_version"]
         python_version = result["wheel_info"]["python_version"]
 
-        # Parse version for proper sorting (e.g., "2.8.0" -> [2, 8, 0])
-        version_parts = [int(x) for x in version.split(".")]
+        # Parse version for proper sorting (e.g., "2.8.0" -> [2, 8, 0]);
+        # tolerant of non-numeric parts like "unknown" or ".post1".
+        version_parts = _int_parts(version)
 
         # Parse python version (e.g., "3.10" -> [3, 10])
-        python_parts = [int(x) for x in python_version.split(".")]
+        python_parts = _int_parts(python_version)
 
         # Return tuple: (negative version for desc order, python version for asc order)
         return ([-x for x in version_parts], python_parts)

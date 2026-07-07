@@ -49,6 +49,20 @@ def set_temp_root(tmpdir_arg: str | None) -> None:
     print(f"Temp root: {tempdir}")
 
 
+def _int_parts(text: str) -> list[int]:
+    """
+    Split a dotted string into integer parts for sorting, tolerating
+    non-numeric components (e.g. "unknown"). Non-numeric parts sort as -1.
+    """
+    parts = []
+    for p in text.split("."):
+        try:
+            parts.append(int(p))
+        except ValueError:
+            parts.append(-1)
+    return parts
+
+
 def fetch_index(variant: str) -> str:
     """
     Fetch HTML index for a single CUDA variant.
@@ -384,9 +398,9 @@ def generate_table(results: list[dict[str, Any]]) -> str:
         variant = result["variant"]
         python_version = result["wheel_info"].get("python_version", "0.0")
 
-        # Parse versions
-        version_parts = tuple(int(x) for x in version.split("."))
-        python_parts = tuple(int(x) for x in python_version.split("."))
+        # Parse versions (tolerant of non-numeric parts like "unknown")
+        version_parts = _int_parts(version)
+        python_parts = _int_parts(python_version)
 
         # Desc version, asc variant, asc python
         return ([-x for x in version_parts], variant, python_parts)
@@ -420,8 +434,8 @@ def generate_csv(results: list[dict[str, Any]]) -> str:
         version = result["package_version"]
         variant = result["variant"]
         python_version = result["wheel_info"].get("python_version", "0.0")
-        version_parts = tuple(int(x) for x in version.split("."))
-        python_parts = tuple(int(x) for x in python_version.split("."))
+        version_parts = _int_parts(version)
+        python_parts = _int_parts(python_version)
         return ([-x for x in version_parts], variant, python_parts)
 
     sorted_results = sorted(results, key=sort_key)
