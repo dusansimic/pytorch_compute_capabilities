@@ -15,6 +15,7 @@ cache after every wheel, so partial progress is never lost.
 
 from pathlib import Path
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -26,6 +27,25 @@ import requests
 
 # Directory holding one JSON file per analyzed wheel (the resumable cache).
 CACHE_DIR = Path("cache_pip")
+
+
+def set_temp_root(tmpdir_arg: str | None) -> None:
+    """
+    Set tempfile.tempdir to ensure temp files go to disk, not tmpfs.
+    Priority: arg → $TMPDIR → ./wheel_tmp (created).
+    """
+    if tmpdir_arg:
+        tempdir = Path(tmpdir_arg)
+    else:
+        tmpdir_env = os.environ.get("TMPDIR")
+        if tmpdir_env:
+            tempdir = Path(tmpdir_env)
+        else:
+            tempdir = Path.cwd() / "wheel_tmp"
+
+    tempdir.mkdir(parents=True, exist_ok=True)
+    tempfile.tempdir = str(tempdir)
+    print(f"Temp root: {tempdir}")
 
 
 def get_pypi_package_info(
@@ -193,6 +213,39 @@ def extract_wheel(wheel_path: Path, extract_dir: Path) -> Path:
 
     print(f"Extracted to {extract_dir}")
     return extract_dir
+
+
+def extract_libtorch_cuda(wheel_path: Path, dest_dir: Path) -> Path | None:
+    """
+    Extract only torch/lib/libtorch_cuda.so from wheel.
+
+    Args:
+        wheel_path: Path to .whl file
+        dest_dir: Destination directory
+
+    Returns:
+        Path to libtorch_cuda.so or None if not found
+    """
+    try:
+        with zipfile.ZipFile(wheel_path, "r") as zf:
+            # Find the entry ending with torch/lib/libtorch_cuda.so
+            target = None
+            for name in zf.namelist():
+                if name.endswith("torch/lib/libtorch_cuda.so"):
+                    target = name
+                    break
+
+            if target:
+                zf.extract(target, dest_dir)
+                so_path = dest_dir / target
+                print(f"Extracted {target}")
+                return so_path
+            else:
+                print(f"Warning: torch/lib/libtorch_cuda.so not found in {wheel_path}")
+                return None
+    except Exception as e:
+        print(f"Error extracting {wheel_path}: {e}")
+        return None
 
 
 def get_cuda_architectures(extract_dir: Path) -> list[str]:
@@ -380,12 +433,19 @@ def process_wheel(wheel: dict[str, str], package_version: str) -> dict[str, Any]
             # Download the wheel
             wheel_path = download_wheel(wheel["url"], wheel["filename"], temp_path)
 
-            # Extract the wheel
+            # Extract only libtorch_cuda.so
             extract_dir = temp_path / "extracted"
             extract_dir.mkdir()
-            extract_wheel(wheel_path, extract_dir)
+            so_path = extract_libtorch_cuda(wheel_path, extract_dir)
+            if not so_path:
+                print(f"✗ Could not extract libtorch_cuda.so from {wheel['filename']}")
+                return {
+                    "wheel_info": wheel,
+                    "cuda_architectures": [],
+                    "package_version": package_version,
+                }
 
-            # Get CUDA architectures
+            # Get CUDA architectures from the .so file
             archs = get_cuda_architectures(extract_dir)
 
             # Clean up arch strings to just extract sm_XX values
@@ -558,6 +618,15 @@ def generate_comprehensive_pip_table(all_results: list[dict[str, Any]]) -> str:
 
 def main():
     """Main function to analyze all PyTorch 2.x versions and generate comprehensive table."""
+    import argparse
+
+    parser = argparse.ArgumentParser(description="Analyze PyTorch wheels from PyPI")
+    parser.add_argument("--tmpdir", help="Disk-backed temp directory (default: $TMPDIR or ./wheel_tmp)")
+    parser.add_argument("-y", "--yes", action="store_true", help="Skip confirmation prompt")
+    args = parser.parse_args()
+
+    set_temp_root(args.tmpdir)
+
     package = "torch"
 
     # Get all PyTorch 2.x versions
@@ -608,8 +677,7 @@ def main():
     print()
 
     # Ask for confirmation, unless -y/--yes was passed or stdin is non-interactive.
-    assume_yes = any(arg in ("-y", "--yes") for arg in sys.argv[1:])
-    if remaining > 0 and not assume_yes and sys.stdin.isatty():
+    if remaining > 0 and not args.yes and sys.stdin.isatty():
         try:
             confirm = input("Do you want to proceed? (y/N): ").strip().lower()
             if confirm not in ["y", "yes"]:

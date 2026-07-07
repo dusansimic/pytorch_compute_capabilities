@@ -85,6 +85,9 @@ Run the scripts:
     # PyPI wheels (-y skips the download-size confirmation)
     uv run pytorch_compute_capabilities_pip.py -y
 
+    # PyTorch download index (default: cu118 cu121 cu124 cu126 cu128)
+    uv run pytorch_compute_capabilities_download.py -y
+
 These are long, bandwidth-heavy jobs. On a VPS run them under
 tmux so they survive disconnects:
 
@@ -92,7 +95,13 @@ tmux so they survive disconnects:
     uv run pytorch_compute_capabilities.py --channel conda-forge
     # detach: Ctrl-b then d   |   reattach: tmux attach -t pcc
 
-Both scripts are resumable: progress is cached (cache/, cache_pip/)
-and re-running skips work that is already done.
+For long-running scripts, set a disk-backed temp directory to avoid
+tmpfs exhaustion (especially on Hetzner VMs where /tmp is small):
+
+    uv run pytorch_compute_capabilities_pip.py --tmpdir /var/tmp -y
+    uv run pytorch_compute_capabilities_download.py --tmpdir /var/tmp -y
+
+All scripts are resumable: progress is cached (cache/, cache_pip/,
+cache_download/) and re-running skips work that is already done.
 ============================================================
 EOF
